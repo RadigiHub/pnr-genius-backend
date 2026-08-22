@@ -841,6 +841,28 @@ def _fs_iso(raw):
         return None
 
 
+def _fs_live_position(raw_flight):
+    """Best-effort extraction of AeroDataBox's real-time position block
+    (only present when ?withLocation=true returns data for this flight —
+    not every flight has it, e.g. still on the ground or outside coverage).
+    Checks the common field-name variants and returns None if nothing
+    matches, so the frontend just falls back to its time-estimated
+    position — nothing breaks either way."""
+    loc = raw_flight.get("location")
+    if not isinstance(loc, dict):
+        return None
+    lat = loc.get("lat", loc.get("latitude"))
+    lon = loc.get("lon", loc.get("lng", loc.get("longitude")))
+    if lat is None or lon is None:
+        return None
+    reported = loc.get("reportedAtUtc") or loc.get("updatedUtc") or loc.get("timeUtc")
+    return {
+        "lat": lat,
+        "lon": lon,
+        "updatedUtc": _fs_iso(reported) if reported else None,
+    }
+
+
 def _fs_normalize(raw_flight):
     dep = raw_flight.get("departure", {}) or {}
     arr = raw_flight.get("arrival", {}) or {}
@@ -886,6 +908,7 @@ def _fs_normalize(raw_flight):
         },
         "aircraft": aircraft.get("model"),
         "aircraftReg": aircraft.get("reg"),
+        "livePosition": _fs_live_position(raw_flight),
         "source": "AeroDataBox",
     }
 
@@ -914,6 +937,7 @@ def flight_status(flight_number):
     url = f"https://{AERODATABOX_HOST}/flights/number/{flight_number}"
     if date:
         url += f"/{date}"
+    url += "?withLocation=true"
 
     try:
         req = urllib.request.Request(url, headers={
