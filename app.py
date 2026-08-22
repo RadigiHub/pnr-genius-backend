@@ -619,9 +619,9 @@ def parse_pnr(raw_text):
 
     if is_round_trip:
         turnaround_index = len(segments) // 2
-        route_summary = f"{segments[0]['origin']['code']} \u21c4 {segments[turnaround_index - 1]['destination']['code']}"
+        route_summary = f"{segments[0]['origin']['code']} ⇄ {segments[turnaround_index - 1]['destination']['code']}"
     else:
-        route_summary = f"{segments[0]['origin']['code']} \u2192 {segments[-1]['destination']['code']}"
+        route_summary = f"{segments[0]['origin']['code']} → {segments[-1]['destination']['code']}"
 
     total_distance_km = sum(s["distance_km"] for s in segments if s.get("distance_km"))
     total_distance_miles = sum(s["distance_miles"] for s in segments if s.get("distance_miles"))
@@ -827,6 +827,20 @@ def _fs_pick_most_relevant(flights):
     return best
 
 
+def _fs_iso(raw):
+    """AeroDataBox returns UTC timestamps like '2026-08-21 05:25Z'. Convert
+    to strict ISO-8601 ('...T...Z') so JavaScript's `new Date(...)` on the
+    frontend parses it reliably everywhere (Safari especially is picky) —
+    needed for the live progress bar / mini-map position math."""
+    if not raw:
+        return None
+    try:
+        dt = datetime.strptime(raw, "%Y-%m-%d %H:%MZ")
+        return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return None
+
+
 def _fs_normalize(raw_flight):
     dep = raw_flight.get("departure", {}) or {}
     arr = raw_flight.get("arrival", {}) or {}
@@ -834,29 +848,44 @@ def _fs_normalize(raw_flight):
     aircraft = raw_flight.get("aircraft", {}) or {}
 
     def times(node):
+        sched = node.get("scheduledTime") or {}
+        est = node.get("revisedTime") or node.get("predictedTime") or node.get("estimatedTime") or {}
+        act = node.get("actualTime") or node.get("runwayTime") or {}
         return {
-            "scheduled": (node.get("scheduledTime") or {}).get("local"),
-            "estimated": (node.get("revisedTime") or node.get("predictedTime") or node.get("estimatedTime") or {}).get("local"),
-            "actual": (node.get("actualTime") or node.get("runwayTime") or {}).get("local"),
+            "scheduled": sched.get("local"),
+            "scheduledUtc": _fs_iso(sched.get("utc")),
+            "estimated": est.get("local"),
+            "estimatedUtc": _fs_iso(est.get("utc")),
+            "actual": act.get("local"),
+            "actualUtc": _fs_iso(act.get("utc")),
             "terminal": node.get("terminal"),
             "gate": node.get("gate"),
         }
 
+    dep_airport = dep.get("airport") or {}
+    arr_airport = arr.get("airport") or {}
+
     return {
         "flightNumber": raw_flight.get("number"),
         "airline": airline.get("name"),
+        "airlineIata": airline.get("iata"),
         "status": raw_flight.get("status", "Unknown"),
         "departure": {
-            "airport": (dep.get("airport") or {}).get("name"),
-            "iata": (dep.get("airport") or {}).get("iata"),
+            "airport": dep_airport.get("name"),
+            "iata": dep_airport.get("iata"),
+            "lat": (dep_airport.get("location") or {}).get("lat"),
+            "lon": (dep_airport.get("location") or {}).get("lon"),
             **times(dep),
         },
         "arrival": {
-            "airport": (arr.get("airport") or {}).get("name"),
-            "iata": (arr.get("airport") or {}).get("iata"),
+            "airport": arr_airport.get("name"),
+            "iata": arr_airport.get("iata"),
+            "lat": (arr_airport.get("location") or {}).get("lat"),
+            "lon": (arr_airport.get("location") or {}).get("lon"),
             **times(arr),
         },
         "aircraft": aircraft.get("model"),
+        "aircraftReg": aircraft.get("reg"),
         "source": "AeroDataBox",
     }
 
