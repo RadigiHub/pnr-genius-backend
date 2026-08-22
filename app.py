@@ -725,6 +725,197 @@ def airline_logo(airline_code):
 
 
 # ---------------------------------------------------------------------------
+# LIVE FLIGHT STATUS
+# Powers the /flight-status.html search tool. Data comes from AeroDataBox
+# (via RapidAPI, free tier: 600 lookups/month). A shared Upstash Redis cache
+# sits in front of it (also free tier) so a burst of searches for the same
+# popular flight number only spends one real API call — everyone else in
+# that window gets served from cache. Requires three env vars set in the
+# Vercel project (Settings -> Environment Variables):
+#   AERODATABOX_RAPIDAPI_KEY, UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN
+# Verified against a live AeroDataBox response on 2026-08-21 (AA100, JFK-LHR).
+# ---------------------------------------------------------------------------
+
+import os
+
+AERODATABOX_KEY = os.environ.get("AERODATABOX_RAPIDAPI_KEY", "")
+AERODATABOX_HOST = "aerodatabox.p.rapidapi.com"
+UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "").rstrip("/")
+UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
+FLIGHT_STATUS_CACHE_TTL = 180          # seconds
+FLIGHT_STATUS_RATE_LIMIT_PER_HOUR = 30  # per IP
+
+
+def _upstash_request(path, method="GET", body=None):
+    """Minimal urllib-based client for Upstash's Redis REST API — matches
+    this file's existing pattern of using urllib instead of adding the
+    `requests` package as a dependency. Returns the parsed 'result' value,
+    or None on any failure (a cache outage should never break the feature)."""
+    if not UPSTASH_URL or not UPSTASH_TOKEN:
+        return None
+    try:
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(
+            f"{UPSTASH_URL}{path}",
+            data=data,
+            method=method,
+            headers={
+                "Authorization": f"Bearer {UPSTASH_TOKEN}",
+                "Content-Type": "application/json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            return json.loads(resp.read()).get("result")
+    except Exception:
+        return None
+
+
+def _fs_cache_get(key):
+    result = _upstash_request(f"/get/{key}")
+    if result:
+        try:
+            return json.loads(result)
+        except Exception:
+            return None
+    return None
+
+
+def _fs_cache_set(key, value, ttl_seconds):
+    _upstash_request(f"/set/{key}?EX={ttl_seconds}", method="POST", body=json.dumps(value))
+
+
+def _fs_rate_limit_ok(ip):
+    bucket = f"fs_ratelimit:{ip}:{int(datetime.utcnow().timestamp() // 3600)}"
+    count = _upstash_request(f"/incr/{bucket}", method="POST")
+    if count is None:
+        return True  # fail open — a Redis hiccup shouldn't take the feature down
+    if count == 1:
+        _upstash_request(f"/expire/{bucket}/3600", method="POST")
+    return count <= FLIGHT_STATUS_RATE_LIMIT_PER_HOUR
+
+
+def _fs_parse_utc(node):
+    raw = (node.get("scheduledTime") or {}).get("utc")
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d %H:%MZ")
+    except ValueError:
+        return None
+
+
+def _fs_pick_most_relevant(flights):
+    """AeroDataBox's 'nearest day' endpoint can return more than one match
+    for a flight number (e.g. yesterday's already-Arrived flight AND
+    today's EnRoute one). Pick whichever entry's scheduled departure is
+    closest to right now — verified live on 2026-08-21 against a real
+    two-entry AA100 response, where this correctly picked the EnRoute one
+    over the stale Arrived one."""
+    if not flights:
+        return None
+    if len(flights) == 1:
+        return flights[0]
+    now = datetime.utcnow()
+    best, best_delta = flights[0], None
+    for f in flights:
+        dep_time = _fs_parse_utc(f.get("departure", {}) or {})
+        if dep_time is None:
+            continue
+        delta = abs((dep_time - now).total_seconds())
+        if best_delta is None or delta < best_delta:
+            best, best_delta = f, delta
+    return best
+
+
+def _fs_normalize(raw_flight):
+    dep = raw_flight.get("departure", {}) or {}
+    arr = raw_flight.get("arrival", {}) or {}
+    airline = raw_flight.get("airline", {}) or {}
+    aircraft = raw_flight.get("aircraft", {}) or {}
+
+    def times(node):
+        return {
+            "scheduled": (node.get("scheduledTime") or {}).get("local"),
+            "estimated": (node.get("revisedTime") or node.get("predictedTime") or node.get("estimatedTime") or {}).get("local"),
+            "actual": (node.get("actualTime") or node.get("runwayTime") or {}).get("local"),
+            "terminal": node.get("terminal"),
+            "gate": node.get("gate"),
+        }
+
+    return {
+        "flightNumber": raw_flight.get("number"),
+        "airline": airline.get("name"),
+        "status": raw_flight.get("status", "Unknown"),
+        "departure": {
+            "airport": (dep.get("airport") or {}).get("name"),
+            "iata": (dep.get("airport") or {}).get("iata"),
+            **times(dep),
+        },
+        "arrival": {
+            "airport": (arr.get("airport") or {}).get("name"),
+            "iata": (arr.get("airport") or {}).get("iata"),
+            **times(arr),
+        },
+        "aircraft": aircraft.get("model"),
+        "source": "AeroDataBox",
+    }
+
+
+@app.route("/api/flight-status/<flight_number>", methods=["GET"])
+def flight_status(flight_number):
+    flight_number = flight_number.strip().upper().replace(" ", "")
+    date = request.args.get("date")
+
+    if not flight_number or len(flight_number) > 8 or not re.match(r"^[A-Z0-9]+$", flight_number):
+        return jsonify({"error": "Invalid flight number"}), 400
+
+    client_ip = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0].strip()
+    if not _fs_rate_limit_ok(client_ip):
+        return jsonify({"error": "Too many requests — please wait a bit and try again."}), 429
+
+    cache_key = f"flightstatus:{flight_number}:{date or 'today'}"
+    cached = _fs_cache_get(cache_key)
+    if cached:
+        cached["fromCache"] = True
+        return jsonify(cached)
+
+    if not AERODATABOX_KEY:
+        return jsonify({"error": "Flight status is not configured yet."}), 503
+
+    url = f"https://{AERODATABOX_HOST}/flights/number/{flight_number}"
+    if date:
+        url += f"/{date}"
+
+    try:
+        req = urllib.request.Request(url, headers={
+            "X-RapidAPI-Key": AERODATABOX_KEY,
+            "X-RapidAPI-Host": AERODATABOX_HOST,
+            "User-Agent": "PNRGenius/1.0",
+        })
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return jsonify({"error": f"No flight found for {flight_number}. Check the flight number and try again."}), 404
+        if e.code == 429:
+            return jsonify({"error": "Flight status lookups are at capacity for the day — try again shortly."}), 429
+        return jsonify({"error": "Flight status is temporarily unavailable."}), 502
+    except Exception:
+        return jsonify({"error": "Flight status lookup timed out — try again."}), 504
+
+    if not data:
+        return jsonify({"error": f"No flight found for {flight_number}."}), 404
+
+    best_match = _fs_pick_most_relevant(data) if isinstance(data, list) else data
+    normalized = _fs_normalize(best_match)
+    normalized["fromCache"] = False
+
+    _fs_cache_set(cache_key, normalized, FLIGHT_STATUS_CACHE_TTL)
+
+    return jsonify(normalized)
+
+
+# ---------------------------------------------------------------------------
 # AIRLINE & AIRPORT REFERENCE DIRECTORIES
 # Powers the /airlines and /airports reference pages. Data comes from the
 # OpenFlights open database (https://openflights.org/data.php, ODbL license
