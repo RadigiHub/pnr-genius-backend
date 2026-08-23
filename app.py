@@ -236,9 +236,155 @@ def get_fare_flag(airline_code, booking_class):
     }
 
 
-def parse_pnr_date(date_str, reference_year=None):
-    if reference_year is None:
-        reference_year = datetime.now().year
+# PNR Health Check — best-effort pre-ticketing sanity checks run against the
+# raw pasted text and the parsed segments. These are heuristics reading a
+# copy-pasted PNR dump, not a live GDS query, so every message is written to
+# hedge ("confirm in your GDS") rather than assert a fact we can't verify —
+# consistent with the project rule of never stating false confidence.
+#   TK/TAW element — the ticketing-arrangement / time-limit line used across
+#   Amadeus ("TK OK"/"TK TL..."), Sabre ("TAW"), Galileo/Worldspan ("TKTL").
+#   FQTV element — the frequent-flyer SSR line ("SSR FQTV..."), or a compact
+#   Sabre-style "FFxx1234567" loyalty field.
+TICKETING_ELEMENT_RE = re.compile(r"\bTK\s*(?:OK|TL|XL)|\bTAW\b|\bTKTL\b", re.IGNORECASE)
+FQTV_ELEMENT_RE = re.compile(r"\bFQTV\b|\bFREQUENT\s*FLYER\b|\bFF[A-Z]{2}\d{4,}\b", re.IGNORECASE)
+
+MIN_CONNECTION_MINUTES_DOMESTIC = 45
+MIN_CONNECTION_MINUTES_INTERNATIONAL = 90
+
+
+def check_pnr_health(segments, raw_text):
+    """Returns a list of {type, severity, title, message, segment_index}
+    issues. Empty list means nothing was flagged — not a guarantee the PNR
+    is problem-free, only that these specific checks found nothing."""
+    issues = []
+    text = raw_text or ""
+
+    if not TICKETING_ELEMENT_RE.search(text):
+        issues.append({
+            "type": "ticketing_deadline_missing",
+            "severity": "warning",
+            "title": "No ticketing deadline found",
+            "message": (
+                "No TK / TAW ticketing element was found in the pasted text. "
+                "This PNR may already be ticketed, or the deadline simply "
+                "wasn't included in what you pasted — but if it's still on "
+                "hold, confirm the time limit in your GDS. Unticketed PNRs "
+                "can auto-cancel without warning."
+            ),
+            "segment_index": None,
+        })
+
+    if not FQTV_ELEMENT_RE.search(text):
+        issues.append({
+            "type": "frequent_flyer_missing",
+            "severity": "info",
+            "title": "No frequent-flyer number found",
+            "message": (
+                "No FQTV / loyalty number was found for this booking. Worth "
+                "asking the client if they have a frequent-flyer number to "
+                "add before ticketing — some fares only credit miles or "
+                "allow upgrades if it's on file at the time of booking."
+            ),
+            "segment_index": None,
+        })
+
+    for i in range(len(segments) - 1):
+        current = segments[i]
+        nxt = segments[i + 1]
+        same_airport = current["destination"]["code"] == nxt["origin"]["code"]
+        same_city_diff_airport = (
+            not same_airport
+            and current["destination"].get("city")
+            and nxt["origin"].get("city")
+            and current["destination"]["city"].strip().lower() == nxt["origin"]["city"].strip().lower()
+        )
+
+        day_diff = None
+        if current.get("arrival_date_iso") and nxt.get("date_iso"):
+            try:
+                d1 = datetime.strptime(current["arrival_date_iso"], "%Y-%m-%d")
+                d2 = datetime.strptime(nxt["date_iso"], "%Y-%m-%d")
+                day_diff = (d2 - d1).days
+            except ValueError:
+                day_diff = None
+
+        if same_airport and day_diff is not None and day_diff < 0:
+            issues.append({
+                "type": "impossible_connection",
+                "severity": "warning",
+                "title": f"Segment {i + 2} departs before segment {i + 1} arrives",
+                "message": (
+                    f"Flight {nxt['airline_code']}{nxt['flight_number']} is dated "
+                    f"before {current['airline_code']}{current['flight_number']} "
+                    f"arrives at {current['destination']['code']}. This usually "
+                    f"means a date was mis-typed — double check both segments "
+                    f"before ticketing."
+                ),
+                "segment_index": i,
+            })
+            continue
+
+        if same_city_diff_airport:
+            issues.append({
+                "type": "different_airport_connection",
+                "severity": "warning",
+                "title": f"Airport change in {current['destination']['city']}",
+                "message": (
+                    f"This connects through two different airports in "
+                    f"{current['destination']['city']} — "
+                    f"{current['destination']['code']} to {nxt['origin']['code']}. "
+                    f"The passenger will need to arrange their own ground "
+                    f"transport between them; it isn't a walk-through transfer."
+                ),
+                "segment_index": i,
+            })
+            continue
+
+        if same_airport and current.get("layover_minutes") is not None:
+            minutes = current["layover_minutes"]
+            is_intl_leg = (
+                current["origin"].get("country") != current["destination"].get("country")
+                or nxt["origin"].get("country") != nxt["destination"].get("country")
+            )
+            threshold = MIN_CONNECTION_MINUTES_INTERNATIONAL if is_intl_leg else MIN_CONNECTION_MINUTES_DOMESTIC
+            if 0 <= minutes < threshold:
+                hrs, mins = divmod(minutes, 60)
+                issues.append({
+                    "type": "tight_connection",
+                    "severity": "warning",
+                    "title": f"Tight connection at {current['destination']['code']}",
+                    "message": (
+                        f"Only {hrs}h {mins:02d}m between landing and the next "
+                        f"departure at {current['destination']['code']} — below "
+                        f"the typical {threshold}-minute minimum for a "
+                        f"{'international' if is_intl_leg else 'domestic'} "
+                        f"connection. Actual minimum connection times vary by "
+                        f"airport, so confirm this one is workable before "
+                        f"booking it."
+                    ),
+                    "segment_index": i,
+                })
+
+    return issues
+
+
+def parse_pnr_date(date_str, min_date=None):
+    """Resolves a day+month-only date string (GDS text never includes a
+    year) to a full date. `min_date` is the earliest date this is allowed
+    to resolve to — it defaults to today, so a bare date always resolves to
+    the next upcoming occurrence of that day/month.
+
+    Passing the previous segment's resolved date as `min_date` (see
+    parse_segments) keeps a multi-segment PNR chronologically consistent.
+    Without this, each segment's year was picked independently against the
+    real wall-clock date, so a PNR whose first segment fell a few days
+    *before* today (e.g. pasted on the 23rd with a trip starting the 20th)
+    could roll only that segment into next year while a later segment in
+    the same PNR stayed in the current year — producing a itinerary where
+    segment 2 appeared to depart before segment 1 arrived.
+    """
+    if min_date is None:
+        min_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     match = re.match(r"(\d{1,2})([A-Z]{3})", date_str.upper())
     if not match:
         return None
@@ -247,9 +393,11 @@ def parse_pnr_date(date_str, reference_year=None):
     if not month:
         return None
     try:
-        candidate = datetime(reference_year, month, int(day))
-        if candidate < datetime.now().replace(hour=0, minute=0, second=0, microsecond=0):
-            candidate = datetime(reference_year + 1, month, int(day))
+        year = min_date.year
+        candidate = datetime(year, month, int(day))
+        while candidate < min_date:
+            year += 1
+            candidate = datetime(year, month, int(day))
         return candidate.strftime("%Y-%m-%d"), candidate.strftime("%d %b %Y")
     except ValueError:
         return None, date_str
@@ -469,6 +617,10 @@ def parse_passengers(raw_text):
 def parse_segments(raw_text):
     segments = []
     lines = raw_text.split("\n")
+    # Tracks the earliest a subsequent segment's date is allowed to resolve
+    # to, so segment dates only ever move forward through the PNR — see the
+    # parse_pnr_date docstring for why this matters.
+    running_min_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
 
     for line in lines:
         line = line.strip()
@@ -490,7 +642,12 @@ def parse_segments(raw_text):
         arr_raw = parsed["arr_raw"]
         arr_date = parsed["arr_date_str"]
 
-        iso_date, display_date = parse_pnr_date(date_str) or (None, date_str)
+        iso_date, display_date = parse_pnr_date(date_str, min_date=running_min_date) or (None, date_str)
+        if iso_date:
+            try:
+                running_min_date = datetime.strptime(iso_date, "%Y-%m-%d")
+            except ValueError:
+                pass
         dep_time = format_time(dep_raw)
         arr_time = format_time(arr_raw)
 
@@ -576,12 +733,16 @@ def detect_layovers(segments):
                     diff += 1440
                 hours, mins = divmod(diff, 60)
                 current["layover_after"] = f"{hours}h {mins:02d}m layover in {current['destination']['city']}"
+                current["layover_minutes"] = diff
             except (ValueError, AttributeError, TypeError):
                 current["layover_after"] = None
+                current["layover_minutes"] = None
         else:
             current["layover_after"] = None
+            current["layover_minutes"] = None
     if segments:
         segments[-1]["layover_after"] = None
+        segments[-1]["layover_minutes"] = None
     return segments
 
 
@@ -655,6 +816,7 @@ def parse_pnr(raw_text):
     segments = parse_segments(raw_text)
     segments = detect_layovers(segments)
     pnr_ref = extract_pnr_reference(raw_text)
+    health_checks = check_pnr_health(segments, raw_text)
 
     if not passengers:
         passengers = [{"last_name": "Passenger", "first_name": "Traveller", "title": "", "full_name": "Passenger Traveller"}]
@@ -695,6 +857,9 @@ def parse_pnr(raw_text):
         "is_round_trip": is_round_trip,
         "is_multi_city": len(set([s["origin"]["code"] for s in segments] + [s["destination"]["code"] for s in segments])) > 2,
         "has_fare_flags": any(s.get("fare_flag") for s in segments),
+        "health_checks": health_checks,
+        "health_check_count": len(health_checks),
+        "has_health_issues": len(health_checks) > 0,
     }
     return result
 
@@ -967,267 +1132,4 @@ def _fs_normalize(raw_flight):
     }
 
 
-@app.route("/api/flight-status/<flight_number>", methods=["GET"])
-def flight_status(flight_number):
-    flight_number = flight_number.strip().upper().replace(" ", "")
-    date = request.args.get("date")
-
-    if not flight_number or len(flight_number) > 8 or not re.match(r"^[A-Z0-9]+$", flight_number):
-        return jsonify({"error": "Invalid flight number"}), 400
-
-    client_ip = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0].strip()
-    if not _fs_rate_limit_ok(client_ip):
-        return jsonify({"error": "Too many requests — please wait a bit and try again."}), 429
-
-    cache_key = f"flightstatus:{flight_number}:{date or 'today'}"
-    cached = _fs_cache_get(cache_key)
-    if cached:
-        cached["fromCache"] = True
-        return jsonify(cached)
-
-    if not AERODATABOX_KEY:
-        return jsonify({"error": "Flight status is not configured yet."}), 503
-
-    url = f"https://{AERODATABOX_HOST}/flights/number/{flight_number}"
-    if date:
-        url += f"/{date}"
-    url += "?withLocation=true"
-
-    try:
-        req = urllib.request.Request(url, headers={
-            "X-RapidAPI-Key": AERODATABOX_KEY,
-            "X-RapidAPI-Host": AERODATABOX_HOST,
-            "User-Agent": "PNRGenius/1.0",
-        })
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            data = json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            return jsonify({"error": f"No flight found for {flight_number}. Check the flight number and try again."}), 404
-        if e.code == 429:
-            return jsonify({"error": "Flight status lookups are at capacity for the day — try again shortly."}), 429
-        return jsonify({"error": "Flight status is temporarily unavailable."}), 502
-    except Exception:
-        return jsonify({"error": "Flight status lookup timed out — try again."}), 504
-
-    if not data:
-        return jsonify({"error": f"No flight found for {flight_number}."}), 404
-
-    best_match = _fs_pick_most_relevant(data) if isinstance(data, list) else data
-    normalized = _fs_normalize(best_match)
-    normalized["fromCache"] = False
-
-    _fs_cache_set(cache_key, normalized, FLIGHT_STATUS_CACHE_TTL)
-
-    return jsonify(normalized)
-
-
-# ---------------------------------------------------------------------------
-# AIRLINE & AIRPORT REFERENCE DIRECTORIES
-# Powers the /airlines and /airports reference pages. Data comes from the
-# OpenFlights open database (https://openflights.org/data.php, ODbL license
-# — free to use/redistribute with attribution, which is shown on the
-# frontend directory pages).
-#
-# IMPORTANT: this is fetched live from GitHub on first request per warm
-# server instance, NOT bundled into this repo. Vercel functions have real
-# outbound internet access (unlike a local sandbox), so this works the same
-# way the airline logo proxy above already does — one fetch, cached in
-# memory for the life of that instance, gone on the next cold start (same
-# tradeoff already accepted elsewhere in this file).
-# ---------------------------------------------------------------------------
-
-_of_airports_cache = None
-_of_airlines_cache = None
-
-OPENFLIGHTS_AIRPORTS_URL = "https://raw.githubusercontent.com/jpatokal/openflights/master/data/airports.dat"
-OPENFLIGHTS_AIRLINES_URL = "https://raw.githubusercontent.com/jpatokal/openflights/master/data/airlines.dat"
-
-
-def _clean_field(value):
-    """OpenFlights uses the literal string \\N for NULL fields."""
-    if value is None:
-        return None
-    value = value.strip()
-    if value in ("", "\\N"):
-        return None
-    return value
-
-
-def _fetch_openflights_airports():
-    """
-    Fetches and parses the full OpenFlights airport database (~7,700 airports
-    worldwide). Kept only if a real IATA code exists, since that's what's
-    actually useful for decoding GDS PNRs (military bases / tiny airstrips
-    without IATA codes never appear in a PNR anyway).
-    """
-    global _of_airports_cache
-    if _of_airports_cache is not None:
-        return _of_airports_cache
-
-    req = urllib.request.Request(OPENFLIGHTS_AIRPORTS_URL, headers={"User-Agent": "PNRGenius/1.0"})
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        raw = resp.read().decode("utf-8", errors="replace")
-
-    airports = []
-    reader = csv.reader(io.StringIO(raw))
-    for row in reader:
-        if len(row) < 12:
-            continue
-        try:
-            name = _clean_field(row[1])
-            city = _clean_field(row[2])
-            country = _clean_field(row[3])
-            iata = _clean_field(row[4])
-            icao = _clean_field(row[5])
-            tz = _clean_field(row[11]) if len(row) > 11 else None
-
-            if not name or name.startswith("[Duplicate]") or name in ("Unknown", "Private flight"):
-                continue
-            if not iata:
-                continue  # not relevant to GDS PNR decoding
-
-            lat = lng = None
-            try:
-                lat = float(row[6])
-                lng = float(row[7])
-            except (ValueError, IndexError):
-                pass
-
-            airports.append({
-                "name": name,
-                "city": city or "",
-                "country": country or "",
-                "iata": iata,
-                "icao": icao,
-                "lat": lat,
-                "lng": lng,
-                "tz": tz,
-            })
-        except (IndexError, ValueError):
-            continue
-
-    _of_airports_cache = airports
-    return airports
-
-
-def _fetch_openflights_airlines():
-    """
-    Fetches and parses the full OpenFlights airline database. Filtered to
-    Active == 'Y' and a real IATA or ICAO code present, to keep the
-    directory focused on carriers that actually appear in live PNRs rather
-    than the thousands of defunct/historical entries in the raw dataset.
-    """
-    global _of_airlines_cache
-    if _of_airlines_cache is not None:
-        return _of_airlines_cache
-
-    req = urllib.request.Request(OPENFLIGHTS_AIRLINES_URL, headers={"User-Agent": "PNRGenius/1.0"})
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        raw = resp.read().decode("utf-8", errors="replace")
-
-    airlines = []
-    reader = csv.reader(io.StringIO(raw))
-    for row in reader:
-        if len(row) < 8:
-            continue
-        try:
-            name = _clean_field(row[1])
-            iata = _clean_field(row[3])
-            icao = _clean_field(row[4])
-            callsign = _clean_field(row[5])
-            country = _clean_field(row[6])
-            active = _clean_field(row[7])
-
-            if not name or name in ("Unknown", "Private flight"):
-                continue
-            if active != "Y":
-                continue
-            if not iata and not icao:
-                continue
-
-            airlines.append({
-                "name": name,
-                "iata": iata,
-                "icao": icao,
-                "callsign": callsign or "",
-                "country": country or "",
-            })
-        except (IndexError, ValueError):
-            continue
-
-    airlines.sort(key=lambda a: a["name"].lower())
-    _of_airlines_cache = airlines
-    return airlines
-
-
-def _paginate_and_search(items, search_fields):
-    q = request.args.get("q", "").strip().lower()
-    if q:
-        filtered = []
-        for item in items:
-            haystack = " ".join(str(item.get(f, "") or "") for f in search_fields).lower()
-            if q in haystack:
-                filtered.append(item)
-    else:
-        filtered = items
-
-    try:
-        limit = max(1, min(int(request.args.get("limit", 60)), 300))
-    except ValueError:
-        limit = 60
-    try:
-        offset = max(0, int(request.args.get("offset", 0)))
-    except ValueError:
-        offset = 0
-
-    page = filtered[offset:offset + limit]
-    return page, len(filtered), len(items)
-
-
-@app.route("/api/airports", methods=["GET"])
-def api_airports():
-    try:
-        airports = _fetch_openflights_airports()
-    except Exception as e:
-        return jsonify({
-            "success": False,
-            "error": "Could not load airport directory right now. Please try again shortly.",
-            "detail": str(e),
-        }), 502
-
-    page, matched, total = _paginate_and_search(airports, ["name", "city", "country", "iata", "icao"])
-    return jsonify({
-        "success": True,
-        "results": page,
-        "matched": matched,
-        "total": total,
-        "source": "OpenFlights (openflights.org), ODbL license",
-    })
-
-
-@app.route("/api/airlines", methods=["GET"])
-def api_airlines():
-    try:
-        airlines = _fetch_openflights_airlines()
-    except Exception as e:
-        return jsonify({
-            "success": False,
-            "error": "Could not load airline directory right now. Please try again shortly.",
-            "detail": str(e),
-        }), 502
-
-    page, matched, total = _paginate_and_search(airlines, ["name", "iata", "icao", "callsign", "country"])
-    return jsonify({
-        "success": True,
-        "results": page,
-        "matched": matched,
-        "total": total,
-        "source": "OpenFlights (openflights.org), ODbL license",
-    })
-
-
-if __name__ == "__main__":
-    import os
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+@app.route("/api/flight-status/<flight_number>"
