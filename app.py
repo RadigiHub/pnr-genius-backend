@@ -1132,4 +1132,267 @@ def _fs_normalize(raw_flight):
     }
 
 
-@app.route("/api/flight-status/<flight_number>"
+@app.route("/api/flight-status/<flight_number>", methods=["GET"])
+def flight_status(flight_number):
+    flight_number = flight_number.strip().upper().replace(" ", "")
+    date = request.args.get("date")
+
+    if not flight_number or len(flight_number) > 8 or not re.match(r"^[A-Z0-9]+$", flight_number):
+        return jsonify({"error": "Invalid flight number"}), 400
+
+    client_ip = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0].strip()
+    if not _fs_rate_limit_ok(client_ip):
+        return jsonify({"error": "Too many requests — please wait a bit and try again."}), 429
+
+    cache_key = f"flightstatus:{flight_number}:{date or 'today'}"
+    cached = _fs_cache_get(cache_key)
+    if cached:
+        cached["fromCache"] = True
+        return jsonify(cached)
+
+    if not AERODATABOX_KEY:
+        return jsonify({"error": "Flight status is not configured yet."}), 503
+
+    url = f"https://{AERODATABOX_HOST}/flights/number/{flight_number}"
+    if date:
+        url += f"/{date}"
+    url += "?withLocation=true"
+
+    try:
+        req = urllib.request.Request(url, headers={
+            "X-RapidAPI-Key": AERODATABOX_KEY,
+            "X-RapidAPI-Host": AERODATABOX_HOST,
+            "User-Agent": "PNRGenius/1.0",
+        })
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return jsonify({"error": f"No flight found for {flight_number}. Check the flight number and try again."}), 404
+        if e.code == 429:
+            return jsonify({"error": "Flight status lookups are at capacity for the day — try again shortly."}), 429
+        return jsonify({"error": "Flight status is temporarily unavailable."}), 502
+    except Exception:
+        return jsonify({"error": "Flight status lookup timed out — try again."}), 504
+
+    if not data:
+        return jsonify({"error": f"No flight found for {flight_number}."}), 404
+
+    best_match = _fs_pick_most_relevant(data) if isinstance(data, list) else data
+    normalized = _fs_normalize(best_match)
+    normalized["fromCache"] = False
+
+    _fs_cache_set(cache_key, normalized, FLIGHT_STATUS_CACHE_TTL)
+
+    return jsonify(normalized)
+
+
+# ---------------------------------------------------------------------------
+# AIRLINE & AIRPORT REFERENCE DIRECTORIES
+# Powers the /airlines and /airports reference pages. Data comes from the
+# OpenFlights open database (https://openflights.org/data.php, ODbL license
+# — free to use/redistribute with attribution, which is shown on the
+# frontend directory pages).
+#
+# IMPORTANT: this is fetched live from GitHub on first request per warm
+# server instance, NOT bundled into this repo. Vercel functions have real
+# outbound internet access (unlike a local sandbox), so this works the same
+# way the airline logo proxy above already does — one fetch, cached in
+# memory for the life of that instance, gone on the next cold start (same
+# tradeoff already accepted elsewhere in this file).
+# ---------------------------------------------------------------------------
+
+_of_airports_cache = None
+_of_airlines_cache = None
+
+OPENFLIGHTS_AIRPORTS_URL = "https://raw.githubusercontent.com/jpatokal/openflights/master/data/airports.dat"
+OPENFLIGHTS_AIRLINES_URL = "https://raw.githubusercontent.com/jpatokal/openflights/master/data/airlines.dat"
+
+
+def _clean_field(value):
+    """OpenFlights uses the literal string \\N for NULL fields."""
+    if value is None:
+        return None
+    value = value.strip()
+    if value in ("", "\\N"):
+        return None
+    return value
+
+
+def _fetch_openflights_airports():
+    """
+    Fetches and parses the full OpenFlights airport database (~7,700 airports
+    worldwide). Kept only if a real IATA code exists, since that's what's
+    actually useful for decoding GDS PNRs (military bases / tiny airstrips
+    without IATA codes never appear in a PNR anyway).
+    """
+    global _of_airports_cache
+    if _of_airports_cache is not None:
+        return _of_airports_cache
+
+    req = urllib.request.Request(OPENFLIGHTS_AIRPORTS_URL, headers={"User-Agent": "PNRGenius/1.0"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        raw = resp.read().decode("utf-8", errors="replace")
+
+    airports = []
+    reader = csv.reader(io.StringIO(raw))
+    for row in reader:
+        if len(row) < 12:
+            continue
+        try:
+            name = _clean_field(row[1])
+            city = _clean_field(row[2])
+            country = _clean_field(row[3])
+            iata = _clean_field(row[4])
+            icao = _clean_field(row[5])
+            tz = _clean_field(row[11]) if len(row) > 11 else None
+
+            if not name or name.startswith("[Duplicate]") or name in ("Unknown", "Private flight"):
+                continue
+            if not iata:
+                continue  # not relevant to GDS PNR decoding
+
+            lat = lng = None
+            try:
+                lat = float(row[6])
+                lng = float(row[7])
+            except (ValueError, IndexError):
+                pass
+
+            airports.append({
+                "name": name,
+                "city": city or "",
+                "country": country or "",
+                "iata": iata,
+                "icao": icao,
+                "lat": lat,
+                "lng": lng,
+                "tz": tz,
+            })
+        except (IndexError, ValueError):
+            continue
+
+    _of_airports_cache = airports
+    return airports
+
+
+def _fetch_openflights_airlines():
+    """
+    Fetches and parses the full OpenFlights airline database. Filtered to
+    Active == 'Y' and a real IATA or ICAO code present, to keep the
+    directory focused on carriers that actually appear in live PNRs rather
+    than the thousands of defunct/historical entries in the raw dataset.
+    """
+    global _of_airlines_cache
+    if _of_airlines_cache is not None:
+        return _of_airlines_cache
+
+    req = urllib.request.Request(OPENFLIGHTS_AIRLINES_URL, headers={"User-Agent": "PNRGenius/1.0"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        raw = resp.read().decode("utf-8", errors="replace")
+
+    airlines = []
+    reader = csv.reader(io.StringIO(raw))
+    for row in reader:
+        if len(row) < 8:
+            continue
+        try:
+            name = _clean_field(row[1])
+            iata = _clean_field(row[3])
+            icao = _clean_field(row[4])
+            callsign = _clean_field(row[5])
+            country = _clean_field(row[6])
+            active = _clean_field(row[7])
+
+            if not name or name in ("Unknown", "Private flight"):
+                continue
+            if active != "Y":
+                continue
+            if not iata and not icao:
+                continue
+
+            airlines.append({
+                "name": name,
+                "iata": iata,
+                "icao": icao,
+                "callsign": callsign or "",
+                "country": country or "",
+            })
+        except (IndexError, ValueError):
+            continue
+
+    airlines.sort(key=lambda a: a["name"].lower())
+    _of_airlines_cache = airlines
+    return airlines
+
+
+def _paginate_and_search(items, search_fields):
+    q = request.args.get("q", "").strip().lower()
+    if q:
+        filtered = []
+        for item in items:
+            haystack = " ".join(str(item.get(f, "") or "") for f in search_fields).lower()
+            if q in haystack:
+                filtered.append(item)
+    else:
+        filtered = items
+
+    try:
+        limit = max(1, min(int(request.args.get("limit", 60)), 300))
+    except ValueError:
+        limit = 60
+    try:
+        offset = max(0, int(request.args.get("offset", 0)))
+    except ValueError:
+        offset = 0
+
+    page = filtered[offset:offset + limit]
+    return page, len(filtered), len(items)
+
+
+@app.route("/api/airports", methods=["GET"])
+def api_airports():
+    try:
+        airports = _fetch_openflights_airports()
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": "Could not load airport directory right now. Please try again shortly.",
+            "detail": str(e),
+        }), 502
+
+    page, matched, total = _paginate_and_search(airports, ["name", "city", "country", "iata", "icao"])
+    return jsonify({
+        "success": True,
+        "results": page,
+        "matched": matched,
+        "total": total,
+        "source": "OpenFlights (openflights.org), ODbL license",
+    })
+
+
+@app.route("/api/airlines", methods=["GET"])
+def api_airlines():
+    try:
+        airlines = _fetch_openflights_airlines()
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": "Could not load airline directory right now. Please try again shortly.",
+            "detail": str(e),
+        }), 502
+
+    page, matched, total = _paginate_and_search(airlines, ["name", "iata", "icao", "callsign", "country"])
+    return jsonify({
+        "success": True,
+        "results": page,
+        "matched": matched,
+        "total": total,
+        "source": "OpenFlights (openflights.org), ODbL license",
+    })
+
+
+if __name__ == "__main__":
+    import os
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
