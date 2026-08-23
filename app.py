@@ -107,6 +107,11 @@ AIRLINES = {
     "SK": "SAS", "AY": "Finnair", "TP": "TAP Air Portugal", "FZ": "flydubai",
     "G9": "Air Arabia", "PC": "Pegasus Airlines", "W6": "Wizz Air",
     "U2": "easyJet", "FR": "Ryanair", "VY": "Vueling",
+    # Added for US/UK/Canada/Australia/NZ coverage
+    "AC": "Air Canada", "WS": "WestJet", "PD": "Porter Airlines", "TS": "Air Transat",
+    "WN": "Southwest Airlines", "B6": "JetBlue Airways", "AS": "Alaska Airlines",
+    "NK": "Spirit Airlines", "F9": "Frontier Airlines", "HA": "Hawaiian Airlines",
+    "QF": "Qantas", "JQ": "Jetstar Airways", "VA": "Virgin Australia", "NZ": "Air New Zealand",
 }
 
 MONTHS = {
@@ -182,6 +187,53 @@ STATUS_CODES = {
     "HK": "Confirmed", "KK": "Confirmed", "HL": "Waitlisted", "KL": "Waitlisted",
     "UN": "Unable", "UC": "Unable", "NN": "Pending", "TK": "Confirmed", "RR": "Confirmed",
 }
+
+# Proactive fare flags: booking classes verified, per-airline, against each
+# carrier's own agent-facing documentation (not guessed from generic class
+# tables, since the same letter means different things on different
+# airlines — see CABIN_CODES above). Only airlines with a directly verified
+# source are listed; unlisted airlines simply get no flag rather than a
+# guessed one. Extend this table as more carriers are verified — do not
+# add an entry without a source.
+#   AA — saleslink.aa.com Basic Economy Reference Guide ("booked in B on all
+#        AA operated flights", domestic and international)
+#   DL — pro.delta.com agency portal ("booking code for Basic Economy fares
+#        will be 'E' class")
+#   UA — United's Basic Economy fare class identifiers are N and G
+#   AC — Air Canada Branded Fares GDS User Guide (TANGO, the carrier's
+#        lowest bundle, quotes in L class)
+#   BA — British Airways has no single "Basic Economy" bucket; Q/O/G are
+#        its lowest, most-restrictive Economy fare tier
+FARE_FLAG_RULES = {
+    "AA": {"classes": ["B"], "label": "Basic Economy"},
+    "DL": {"classes": ["E"], "label": "Basic Economy"},
+    "UA": {"classes": ["N", "G"], "label": "Basic Economy"},
+    "AC": {"classes": ["L"], "label": "Tango (lowest fare bundle)"},
+    "BA": {"classes": ["Q", "O", "G"], "label": "lowest Economy fare tier"},
+}
+
+
+def get_fare_flag(airline_code, booking_class):
+    """Best-effort, source-verified flag for restrictive/basic fares.
+    Returns None (no flag) for any airline not in FARE_FLAG_RULES, rather
+    than guessing — silence is safer than a wrong flag here."""
+    if not airline_code or not booking_class:
+        return None
+    rule = FARE_FLAG_RULES.get(airline_code.upper())
+    if not rule or booking_class.upper() not in rule["classes"]:
+        return None
+    airline_name = get_airline_info(airline_code)
+    return {
+        "label": rule["label"],
+        "booking_class": booking_class.upper(),
+        "message": (
+            f"Booking class {booking_class.upper()} on {airline_name} — likely "
+            f"{rule['label']}. Typically no free checked bag, no advance seat "
+            f"selection, boards last, and changes/refunds may be restricted or "
+            f"unavailable. Confirm exact fare rules in your GDS before advising "
+            f"the client."
+        ),
+    }
 
 
 def parse_pnr_date(date_str, reference_year=None):
@@ -490,6 +542,7 @@ def parse_segments(raw_text):
             "overnight": day_offset > 0,
             "distance_km": distance["km"] if distance else None,
             "distance_miles": distance["miles"] if distance else None,
+            "fare_flag": get_fare_flag(airline, cabin),
         })
 
     return segments
@@ -619,9 +672,9 @@ def parse_pnr(raw_text):
 
     if is_round_trip:
         turnaround_index = len(segments) // 2
-        route_summary = f"{segments[0]['origin']['code']} ⇄ {segments[turnaround_index - 1]['destination']['code']}"
+        route_summary = f"{segments[0]['origin']['code']} \u21c4 {segments[turnaround_index - 1]['destination']['code']}"
     else:
-        route_summary = f"{segments[0]['origin']['code']} → {segments[-1]['destination']['code']}"
+        route_summary = f"{segments[0]['origin']['code']} \u2192 {segments[-1]['destination']['code']}"
 
     total_distance_km = sum(s["distance_km"] for s in segments if s.get("distance_km"))
     total_distance_miles = sum(s["distance_miles"] for s in segments if s.get("distance_miles"))
@@ -641,6 +694,7 @@ def parse_pnr(raw_text):
         "total_distance_miles": total_distance_miles if total_distance_miles else None,
         "is_round_trip": is_round_trip,
         "is_multi_city": len(set([s["origin"]["code"] for s in segments] + [s["destination"]["code"] for s in segments])) > 2,
+        "has_fare_flags": any(s.get("fare_flag") for s in segments),
     }
     return result
 
