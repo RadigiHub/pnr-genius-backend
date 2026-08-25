@@ -1311,6 +1311,103 @@ def flight_status(flight_number):
 
 
 # ---------------------------------------------------------------------------
+# SCREENSHOT / PHOTO OCR (via OCR.space free API)
+# Lets an agent upload a photo/screenshot of a GDS booking screen; the
+# extracted text is sent back to the frontend, which drops it into the
+# existing PNR textarea for the agent to review/correct before clicking
+# Convert PNR Now — OCR text is never auto-converted directly, since a
+# misread character on cryptic monospace GDS text could silently produce a
+# wrong itinerary. Requires OCR_SPACE_API_KEY in Vercel's environment
+# variables (free key, no credit card: https://ocr.space/ocrapi/freekey).
+# Verified against OCR.space's documented API contract
+# (https://ocr.space/ocrapi) on 2026-08-25: POST to
+# https://api.ocr.space/parse/image, apikey via header, base64Image via
+# form field (data: URI prefix included), response JSON has
+# ParsedResults[0].ParsedText plus IsErroredOnProcessing/ErrorMessage.
+# Free tier: 1MB max file, 500 requests/day per IP, 25,000/month total.
+# ---------------------------------------------------------------------------
+
+import urllib.parse
+
+OCR_SPACE_API_KEY = os.environ.get("OCR_SPACE_API_KEY", "")
+OCR_SPACE_URL = "https://api.ocr.space/parse/image"
+OCR_MAX_BASE64_CHARS = 1_400_000  # generous ceiling — frontend already compresses to ~900KB
+OCR_RATE_LIMIT_PER_HOUR = 20       # per IP
+
+
+def _ocr_rate_limit_ok(ip):
+    bucket = f"ocr_ratelimit:{ip}:{int(datetime.utcnow().timestamp() // 3600)}"
+    count = _upstash_request(f"/incr/{bucket}", method="POST")
+    if count is None:
+        return True  # fail open — a Redis hiccup shouldn't take the feature down
+    if count == 1:
+        _upstash_request(f"/expire/{bucket}/3600", method="POST")
+    return count <= OCR_RATE_LIMIT_PER_HOUR
+
+
+@app.route("/api/ocr", methods=["POST"])
+def ocr_extract_text():
+    if not OCR_SPACE_API_KEY:
+        return jsonify({"success": False, "error": "Screenshot OCR is not configured yet."}), 503
+
+    client_ip = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0].strip()
+    if not _ocr_rate_limit_ok(client_ip):
+        return jsonify({"success": False, "error": "Too many OCR requests — please wait a bit and try again."}), 429
+
+    data = request.get_json(silent=True)
+    if not data or not data.get("image"):
+        return jsonify({"success": False, "error": "Missing 'image' field in request body."}), 400
+
+    image_data_url = data["image"]
+    if not isinstance(image_data_url, str) or not image_data_url.startswith("data:image/"):
+        return jsonify({"success": False, "error": "Invalid image data."}), 400
+
+    if len(image_data_url) > OCR_MAX_BASE64_CHARS:
+        return jsonify({"success": False, "error": "Image is too large. Please try a smaller screenshot or crop it."}), 413
+
+    try:
+        form_body = urllib.parse.urlencode({
+            "base64Image": image_data_url,
+            "language": "eng",
+            "isOverlayRequired": "false",
+            "OCREngine": "2",
+            "scale": "true",
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            OCR_SPACE_URL,
+            data=form_body,
+            method="POST",
+            headers={
+                "apikey": OCR_SPACE_API_KEY,
+                "Content-Type": "application/x-www-form-urlencoded",
+                "User-Agent": "PNRGenius/1.0",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            result = json.loads(resp.read())
+    except urllib.error.HTTPError:
+        return jsonify({"success": False, "error": "OCR service is temporarily unavailable. Please try again."}), 502
+    except Exception:
+        return jsonify({"success": False, "error": "OCR request timed out — please try again with a smaller image."}), 504
+
+    if result.get("IsErroredOnProcessing"):
+        err_msg = result.get("ErrorMessage")
+        if isinstance(err_msg, list):
+            err_msg = "; ".join(str(m) for m in err_msg)
+        return jsonify({"success": False, "error": err_msg or "Could not read text from this image. Try a clearer screenshot."}), 422
+
+    parsed_results = result.get("ParsedResults") or []
+    if not parsed_results:
+        return jsonify({"success": False, "error": "No text was found in this image."}), 422
+
+    extracted_text = (parsed_results[0].get("ParsedText") or "").strip()
+    if not extracted_text:
+        return jsonify({"success": False, "error": "No text was found in this image. Try a clearer, closer screenshot."}), 422
+
+    return jsonify({"success": True, "text": extracted_text}), 200
+
+
+# ---------------------------------------------------------------------------
 # AIRLINE & AIRPORT REFERENCE DIRECTORIES
 # Powers the /airlines and /airports reference pages. Data comes from the
 # OpenFlights open database (https://openflights.org/data.php, ODbL license
