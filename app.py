@@ -834,9 +834,9 @@ def parse_pnr(raw_text):
 
     if is_round_trip:
         turnaround_index = len(segments) // 2
-        route_summary = f"{segments[0]['origin']['code']} \u21c4 {segments[turnaround_index - 1]['destination']['code']}"
+        route_summary = f"{segments[0]['origin']['code']} ⇄ {segments[turnaround_index - 1]['destination']['code']}"
     else:
-        route_summary = f"{segments[0]['origin']['code']} \u2192 {segments[-1]['destination']['code']}"
+        route_summary = f"{segments[0]['origin']['code']} → {segments[-1]['destination']['code']}"
 
     total_distance_km = sum(s["distance_km"] for s in segments if s.get("distance_km"))
     total_distance_miles = sum(s["distance_miles"] for s in segments if s.get("distance_miles"))
@@ -862,6 +862,129 @@ def parse_pnr(raw_text):
         "has_health_issues": len(health_checks) > 0,
     }
     return result
+
+
+BATCH_SEPARATOR_RE = re.compile(r"^\s*[-=]{3,}\s*$")
+BATCH_MAX_PNRS = 25
+
+
+def split_batch_pnrs(raw_text):
+    """Splits a block of pasted text containing multiple PNRs into a list of
+    individual PNR text blocks.
+
+    Priority 1: explicit separator lines (a line of three or more "-" or "="
+    characters) — if the pasted text contains at least one, split strictly on
+    those and trust the agent's own boundaries.
+
+    Priority 2: auto-detect new-PNR boundaries at passenger-definition lines
+    (e.g. "1.SMITH/JOHNMR") that occur after the current block has already
+    captured at least one real segment line. This deliberately avoids
+    splitting on blank lines alone, which would incorrectly fragment a
+    single PNR that happens to contain blank lines internally.
+    """
+    if not raw_text or not raw_text.strip():
+        return []
+
+    lines = raw_text.split("\n")
+
+    if any(BATCH_SEPARATOR_RE.match(line) for line in lines):
+        blocks = []
+        current = []
+        for line in lines:
+            if BATCH_SEPARATOR_RE.match(line):
+                blocks.append("\n".join(current))
+                current = []
+            else:
+                current.append(line)
+        blocks.append("\n".join(current))
+        return [b.strip() for b in blocks if b.strip()]
+
+    blocks = []
+    current = []
+    seen_segment_in_current = False
+    for line in lines:
+        is_passenger_line = bool(PASSENGER_PATTERN.search(line))
+        if is_passenger_line and seen_segment_in_current and current:
+            blocks.append("\n".join(current))
+            current = []
+            seen_segment_in_current = False
+        current.append(line)
+        if parse_segment_line(line):
+            seen_segment_in_current = True
+
+    if current:
+        blocks.append("\n".join(current))
+
+    return [b.strip() for b in blocks if b.strip()]
+
+
+@app.route("/api/convert-batch", methods=["POST"])
+def convert_pnr_batch_endpoint():
+    try:
+        data = request.get_json(silent=True)
+        if not data or "pnr" not in data:
+            return jsonify({
+                "success": False,
+                "error": "Missing 'pnr' field in request body."
+            }), 400
+
+        raw_pnr = data["pnr"]
+        blocks = split_batch_pnrs(raw_pnr)
+
+        if not blocks:
+            return jsonify({
+                "success": False,
+                "error": "Could not detect any PNRs in this text."
+            }), 400
+
+        if len(blocks) > BATCH_MAX_PNRS:
+            return jsonify({
+                "success": False,
+                "error": (
+                    f"Too many PNRs in one batch (found {len(blocks)}, "
+                    f"max {BATCH_MAX_PNRS}). Please split into smaller batches."
+                )
+            }), 400
+
+        results = []
+        success_count = 0
+        for idx, block in enumerate(blocks):
+            try:
+                parsed = parse_pnr(block)
+                parsed["batch_index"] = idx
+                parsed["batch_source_text"] = block
+                results.append(parsed)
+                success_count += 1
+            except ValueError as ve:
+                results.append({
+                    "success": False,
+                    "batch_index": idx,
+                    "batch_source_text": block,
+                    "error": str(ve),
+                })
+            except Exception as e:
+                results.append({
+                    "success": False,
+                    "batch_index": idx,
+                    "batch_source_text": block,
+                    "error": "Unexpected server error while parsing this PNR.",
+                    "detail": str(e),
+                })
+
+        return jsonify({
+            "success": True,
+            "batch_count": len(blocks),
+            "success_count": success_count,
+            "error_count": len(blocks) - success_count,
+            "results": results,
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": "Unexpected server error while parsing batch PNRs.",
+            "detail": str(e)
+        }), 500
 
 
 @app.route("/", methods=["GET"])
