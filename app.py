@@ -1648,6 +1648,28 @@ def _verify_mailgun_signature(timestamp, token, signature):
         return False
 
 
+def _email_text_set(key, text, ttl_seconds):
+    """Stores a plain string in Redis via _upstash_request directly (NOT via
+    _fs_cache_set/_fs_cache_get — that pair double-JSON-encodes on write but
+    only single-decodes on read, so the value that comes back still has one
+    layer of JSON-string-escaping left in it, e.g. the caller gets back
+    '"line1\\r\\nline2"' — quotes and all — instead of the real text).
+    Passing the raw string straight through as `body` here means
+    _upstash_request's own json.dumps() is the ONLY encoding layer applied,
+    which _email_text_get below undoes with exactly one matching json.loads."""
+    _upstash_request(f"/set/{key}?EX={ttl_seconds}", method="POST", body=text)
+
+
+def _email_text_get(key):
+    raw = _upstash_request(f"/get/{key}")
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
 def _send_email_reply(to_address, reply_link):
     auth = base64.b64encode(f"api:{MAILGUN_API_KEY}".encode()).decode()
     body = urllib.parse.urlencode({
@@ -1699,7 +1721,7 @@ def email_inbound():
     ref = secrets.token_urlsafe(9)
 
     try:
-        _fs_cache_set(f"pnr-email:{ref}", trimmed_text, EMAIL_LINK_TTL_SECONDS)
+        _email_text_set(f"pnr-email:{ref}", trimmed_text, EMAIL_LINK_TTL_SECONDS)
         reply_link = f"{SITE_URL}/?ref={ref}"
         _send_email_reply(sender_email, reply_link)
     except Exception as e:
@@ -1715,7 +1737,7 @@ def email_text():
     if not ref or len(ref) > 40:
         return jsonify({"error": "missing or invalid ref"}), 400
 
-    text = _fs_cache_get(f"pnr-email:{ref}")
+    text = _email_text_get(f"pnr-email:{ref}")
     if not text:
         return jsonify({"error": "This link has expired or is invalid."}), 404
 
