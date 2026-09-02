@@ -1,0 +1,16 @@
+name: Check Schedule-Change Alerts
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch: {}
+
+jobs:
+  check-alerts:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call the alert-check endpoint
+        run: |
+          curl -sS -X POST "https://pnr-genius-backend.vercel.app/api/cron/check-alerts" \
+            -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
+            --fail-with-body
