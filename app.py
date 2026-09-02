@@ -1893,6 +1893,10 @@ def auth_verify():
     if not _redis_get(f"pnr-user:{email}"):
         _redis_set(f"pnr-user:{email}", {"email": email, "created_at": datetime.utcnow().isoformat()})
 
+    # Keep the global user index (used by the Schedule-Change Alerts cron
+    # below) up to date — safe to call on every login, not just signup.
+    _register_user(email)
+
     session_token = secrets.token_urlsafe(32)
     _redis_set(f"pnr-session:{session_token}", email, SESSION_TTL_SECONDS)
 
@@ -2028,6 +2032,235 @@ def bookings_delete(booking_id):
 
     _redis_set(_bookings_key(email), remaining)
     return jsonify({"status": "ok"}), 200
+
+
+# ---------------------------------------------------------------------------
+# SCHEDULE-CHANGE ALERTS (Phase 2, step 3)
+# ---------------------------------------------------------------------------
+# This runs on a schedule driven by an OUTSIDE trigger (a GitHub Actions
+# workflow calling this endpoint every few hours) rather than Vercel's own
+# Cron Jobs — the Hobby (free) plan only allows a cron to fire once a day,
+# which is too slow for "before the client even asks" alerts. The endpoint
+# is protected by CRON_SECRET so nobody else can trigger it and burn through
+# the AeroDataBox quota.
+#
+# For every signed-up user's saved bookings, this checks each flight segment
+# departing in the next ALERT_LOOKAHEAD_DAYS days against AeroDataBox, and
+# emails the agent only when something changed since the LAST check (status,
+# scheduled time, gate, or terminal). The very first check on a booking just
+# records a baseline — it never sends an alert on that first pass, since
+# there's nothing to compare against yet.
+#
+# MAX_ALERT_CHECKS_PER_RUN caps how many AeroDataBox calls happen in one
+# run, so cost stays bounded no matter how many users sign up — anything
+# past the cap is simply picked up on the next run a few hours later.
+# ---------------------------------------------------------------------------
+
+from datetime import timedelta
+
+CRON_SECRET = os.environ.get("CRON_SECRET", "")
+ALERT_LOOKAHEAD_DAYS = 7
+MAX_ALERT_CHECKS_PER_RUN = 60
+ALL_USERS_KEY = "pnr-all-users"
+
+
+def _register_user(email):
+    """Adds email to the global user index used only by the alert-checker
+    to know which users' bookings to scan. Idempotent, and safe to call on
+    every login (not just signup) so an account created before this feature
+    existed gets backfilled the next time that agent signs in."""
+    users = _redis_get(ALL_USERS_KEY) or []
+    if email not in users:
+        users.append(email)
+        _redis_set(ALL_USERS_KEY, users)
+
+
+def _alert_fetch_flight_status(flight_number, date):
+    """A standalone AeroDataBox lookup for the alert-checker — deliberately
+    NOT sharing code or cache keys with flight_status()/_fs_cache_* above.
+    That pair has a known double-JSON-encoding bug on cache reads (see the
+    comment above _email_text_set/_email_text_get, where the same bug was
+    hit and fixed for a different feature) that would make a cache hit here
+    silently come back as a string instead of a dict. Using this file's
+    already-correct _redis_get/_redis_set instead sidesteps it entirely,
+    without touching the existing, already-live /api/flight-status route.
+    Returns the normalized dict, or None on any failure — a lookup hiccup
+    should skip that one segment, not crash the whole run."""
+    cache_key = f"alert-fs-cache:{flight_number}:{date or 'today'}"
+    cached = _redis_get(cache_key)
+    if cached:
+        return cached
+
+    if not AERODATABOX_KEY:
+        return None
+
+    url = f"https://{AERODATABOX_HOST}/flights/number/{flight_number}"
+    if date:
+        url += f"/{date}"
+    url += "?withLocation=true"
+
+    try:
+        req = urllib.request.Request(url, headers={
+            "X-RapidAPI-Key": AERODATABOX_KEY,
+            "X-RapidAPI-Host": AERODATABOX_HOST,
+            "User-Agent": "PNRGenius/1.0",
+        })
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read())
+    except Exception:
+        return None
+
+    if not data:
+        return None
+
+    best_match = _fs_pick_most_relevant(data) if isinstance(data, list) else data
+    normalized = _fs_normalize(best_match)
+    _redis_set(cache_key, normalized, FLIGHT_STATUS_CACHE_TTL)
+    return normalized
+
+
+def _alert_snapshot(status):
+    """The subset of a normalized flight-status dict that actually matters
+    for an alert — comparing only this (not the whole dict, which includes
+    noisier fields like live position) avoids false-positive 'changes'."""
+    dep = status.get("departure") or {}
+    return {
+        "status": status.get("status"),
+        "scheduled": dep.get("scheduled"),
+        "gate": dep.get("gate"),
+        "terminal": dep.get("terminal"),
+    }
+
+
+def _alert_describe_change(old, new):
+    """Plain-English list of what changed, e.g. 'Gate: A12 -> B4'."""
+    lines = []
+    if old.get("status") != new.get("status"):
+        lines.append(f"Status: {old.get('status') or 'Unknown'} → {new.get('status') or 'Unknown'}")
+    if old.get("scheduled") != new.get("scheduled"):
+        lines.append(f"Departure time: {old.get('scheduled') or 'unknown'} → {new.get('scheduled') or 'unknown'}")
+    if old.get("gate") != new.get("gate"):
+        lines.append(f"Gate: {old.get('gate') or 'unassigned'} → {new.get('gate') or 'unassigned'}")
+    if old.get("terminal") != new.get("terminal"):
+        lines.append(f"Terminal: {old.get('terminal') or 'unassigned'} → {new.get('terminal') or 'unassigned'}")
+    return lines
+
+
+def _send_schedule_change_email(to_address, booking_label, flight_number, changes):
+    auth = base64.b64encode(f"api:{MAILGUN_API_KEY}".encode()).decode()
+    change_lines = "\n".join(f"  - {c}" for c in changes)
+    body = urllib.parse.urlencode({
+        "from": f"PNR Genius <noreply@{MAILGUN_SENDING_DOMAIN}>",
+        "to": to_address,
+        "subject": f"Schedule change: {flight_number} ({booking_label})",
+        "text": (
+            f"Hi,\n\nSomething changed on a flight in your saved booking \"{booking_label}\" ({flight_number}):\n\n"
+            f"{change_lines}\n\n"
+            f"See the latest details in My Bookings: {SITE_URL}/my-bookings.html\n\n"
+            "(You're getting this because you saved this PNR on PNR Genius.)\n\n— PNR Genius"
+        ),
+    }).encode()
+    req = urllib.request.Request(
+        f"https://api.mailgun.net/v3/{MAILGUN_SENDING_DOMAIN}/messages",
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Basic {auth}",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=8) as resp:
+        return resp.status
+
+
+@app.route("/api/cron/check-alerts", methods=["GET", "POST"])
+def cron_check_alerts():
+    provided_secret = request.headers.get("Authorization", "").replace("Bearer ", "").strip() or request.args.get("secret", "")
+    if not CRON_SECRET or provided_secret != CRON_SECRET:
+        return jsonify({"error": "unauthorized"}), 401
+
+    today = datetime.utcnow().date()
+    cutoff = today + timedelta(days=ALERT_LOOKAHEAD_DAYS)
+
+    users = _redis_get(ALL_USERS_KEY) or []
+    checks_done = 0
+    alerts_sent = 0
+    users_touched = 0
+
+    for email in users:
+        if checks_done >= MAX_ALERT_CHECKS_PER_RUN:
+            break
+
+        bookings = _get_bookings(email)
+        if not bookings:
+            continue
+
+        touched = False
+
+        for booking in bookings:
+            if checks_done >= MAX_ALERT_CHECKS_PER_RUN:
+                break
+
+            parsed = booking.get("parsed") or {}
+            segments = parsed.get("segments") or []
+            alert_snapshots = booking.get("alert_snapshots") or {}
+
+            for seg in segments:
+                if checks_done >= MAX_ALERT_CHECKS_PER_RUN:
+                    break
+
+                date_iso = seg.get("date_iso")
+                if not date_iso:
+                    continue
+                try:
+                    seg_date = datetime.strptime(date_iso, "%Y-%m-%d").date()
+                except ValueError:
+                    continue
+                if seg_date < today or seg_date > cutoff:
+                    continue
+
+                flight_number = f"{(seg.get('airline_code') or '').upper()}{seg.get('flight_number') or ''}".strip()
+                if not flight_number:
+                    continue
+
+                checks_done += 1
+                status = _alert_fetch_flight_status(flight_number, date_iso)
+                if not status:
+                    continue
+
+                new_snapshot = _alert_snapshot(status)
+                snapshot_key = f"{flight_number}:{date_iso}"
+                old_snapshot = alert_snapshots.get(snapshot_key)
+
+                if old_snapshot:
+                    changes = _alert_describe_change(old_snapshot, new_snapshot)
+                    if changes:
+                        try:
+                            _send_schedule_change_email(
+                                email,
+                                booking.get("label") or parsed.get("route_summary") or "Saved PNR",
+                                flight_number,
+                                changes,
+                            )
+                            alerts_sent += 1
+                        except Exception:
+                            pass
+
+                alert_snapshots[snapshot_key] = new_snapshot
+                touched = True
+
+            booking["alert_snapshots"] = alert_snapshots
+
+        if touched:
+            _redis_set(_bookings_key(email), bookings)
+            users_touched += 1
+
+    return jsonify({
+        "checked": checks_done,
+        "alerts_sent": alerts_sent,
+        "users_touched": users_touched,
+        "users_total": len(users),
+    }), 200
 
 
 if __name__ == "__main__":
