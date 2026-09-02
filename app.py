@@ -1917,6 +1917,119 @@ def auth_logout():
     return jsonify({"status": "ok"}), 200
 
 
+# ---------------------------------------------------------------------------
+# MY BOOKINGS COMMAND CENTER (Phase 2, step 2)
+# ---------------------------------------------------------------------------
+# Lets a signed-in agent save a converted PNR so it's waiting for them next
+# time, instead of re-pasting it. Built directly on the account system above
+# — every route here requires a valid Authorization: Bearer <session_token>.
+#
+# Storage: one Redis key per user holding a JSON array of that user's saved
+# bookings, newest first — simple, and avoids adding Redis list commands
+# (RPUSH/LRANGE) beyond the GET/SET this file already uses everywhere else.
+#   pnr-bookings:<email> -> [ {id, label, raw_text, parsed, added_at}, ... ]
+#
+# This is deliberately just storage + CRUD. Schedule-Change Alerts, Smart PNR
+# Diff and Price-Drop Alerts (later Phase 2 steps) all read from this same
+# list rather than inventing their own.
+# ---------------------------------------------------------------------------
+
+MAX_BOOKINGS_PER_USER = 100
+BOOKING_RAW_TEXT_MAX_LENGTH = 8000
+BOOKING_RECORD_MAX_BYTES = 50000   # guards against an oversized/crafted `parsed` payload
+
+
+def _bookings_key(email):
+    return f"pnr-bookings:{email}"
+
+
+def _get_bookings(email):
+    return _redis_get(_bookings_key(email)) or []
+
+
+@app.route("/api/bookings", methods=["POST"])
+def bookings_create():
+    email = _get_logged_in_email()
+    if not email:
+        return jsonify({"error": "Please sign in first."}), 401
+
+    if not _account_rate_limit_ok(f"bookings_ratelimit:{email}", max_per_hour=60):
+        return jsonify({"error": "Too many saves. Please try again later."}), 429
+
+    data = request.get_json(silent=True) or {}
+    raw_text = (data.get("raw_text") or "").strip()[:BOOKING_RAW_TEXT_MAX_LENGTH]
+    parsed = data.get("parsed") or {}
+    label = (data.get("label") or "").strip()[:120] or parsed.get("route_summary") or "Saved PNR"
+
+    if not raw_text:
+        return jsonify({"error": "Nothing to save — paste and convert a PNR first."}), 400
+
+    bookings = _get_bookings(email)
+    if len(bookings) >= MAX_BOOKINGS_PER_USER:
+        return jsonify({"error": f"You've reached the {MAX_BOOKINGS_PER_USER}-booking limit. Delete an old one first."}), 400
+
+    record = {
+        "id": secrets.token_urlsafe(9),
+        "label": label,
+        "raw_text": raw_text,
+        "parsed": parsed,
+        "added_at": datetime.utcnow().isoformat(),
+    }
+
+    if len(json.dumps(record)) > BOOKING_RECORD_MAX_BYTES:
+        return jsonify({"error": "This PNR is too large to save."}), 400
+
+    bookings.insert(0, record)
+    _redis_set(_bookings_key(email), bookings)
+
+    return jsonify(record), 201
+
+
+@app.route("/api/bookings", methods=["GET"])
+def bookings_list():
+    email = _get_logged_in_email()
+    if not email:
+        return jsonify({"error": "Please sign in first."}), 401
+
+    return jsonify({"bookings": _get_bookings(email)}), 200
+
+
+@app.route("/api/bookings/<booking_id>", methods=["PATCH"])
+def bookings_update(booking_id):
+    email = _get_logged_in_email()
+    if not email:
+        return jsonify({"error": "Please sign in first."}), 401
+
+    data = request.get_json(silent=True) or {}
+    new_label = (data.get("label") or "").strip()[:120]
+    if not new_label:
+        return jsonify({"error": "Label can't be empty."}), 400
+
+    bookings = _get_bookings(email)
+    for b in bookings:
+        if b.get("id") == booking_id:
+            b["label"] = new_label
+            _redis_set(_bookings_key(email), bookings)
+            return jsonify(b), 200
+
+    return jsonify({"error": "Booking not found."}), 404
+
+
+@app.route("/api/bookings/<booking_id>", methods=["DELETE"])
+def bookings_delete(booking_id):
+    email = _get_logged_in_email()
+    if not email:
+        return jsonify({"error": "Please sign in first."}), 401
+
+    bookings = _get_bookings(email)
+    remaining = [b for b in bookings if b.get("id") != booking_id]
+    if len(remaining) == len(bookings):
+        return jsonify({"error": "Booking not found."}), 404
+
+    _redis_set(_bookings_key(email), remaining)
+    return jsonify({"status": "ok"}), 200
+
+
 if __name__ == "__main__":
     import os
     port = int(os.environ.get("PORT", 5000))
