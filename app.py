@@ -30,7 +30,8 @@ CORS(app, resources={
             "https://www.pnrgenius.com",
             "http://localhost:3000",
             "http://127.0.0.1:5500",
-        ]
+        ],
+        "allow_headers": ["Content-Type", "Authorization"],
     }
 })
 
@@ -1742,6 +1743,178 @@ def email_text():
         return jsonify({"error": "This link has expired or is invalid."}), 404
 
     return jsonify({"text": text}), 200
+
+
+# ---------------------------------------------------------------------------
+# OPTIONAL FREE ACCOUNT — MAGIC LINK LOGIN (Phase 2, step 1)
+# ---------------------------------------------------------------------------
+# A lightweight, password-less account system. An agent types their email,
+# gets a one-time sign-in link by email, and clicking it logs them in — the
+# account is created automatically the first time someone logs in, so there
+# is no separate "sign up" step and nothing that can be forgotten, like a
+# password.
+#
+# Storage is Upstash Redis (already used elsewhere in this file for caching
+# and rate limits) — three key shapes, no new database needed:
+#   pnr-user:<email>            -> {"email", "created_at"}   (no expiry — the account record)
+#   pnr-login-token:<token>     -> email                     (15 min TTL, one-time use)
+#   pnr-session:<session_token> -> email                     (30 day TTL)
+#
+# The frontend stores the session_token in localStorage and sends it back as
+# "Authorization: Bearer <session_token>" on any request that needs to know
+# who's logged in. We use a bearer token instead of a cookie because the
+# frontend (pnrgenius.com) and this API are on different domains — a
+# cross-domain cookie needs extra CORS/SameSite plumbing that a bearer token
+# skips entirely.
+# ---------------------------------------------------------------------------
+
+LOGIN_TOKEN_TTL_SECONDS = 15 * 60          # magic link is valid for 15 minutes
+SESSION_TTL_SECONDS = 30 * 24 * 60 * 60    # stays logged in for 30 days
+EMAIL_RE = re.compile(r"^[\w.+-]+@[\w-]+\.[\w.-]+$")
+
+
+def _redis_set(key, value, ttl_seconds=None):
+    """Stores any JSON-safe value (a plain string, or a dict) with exactly
+    one JSON-encoding layer. Pass the raw value itself — never a pre-dumped
+    string — so _upstash_request's own json.dumps() is the only encoding
+    applied. (This mirrors the fix already used by _email_text_set /
+    _email_text_get above: the old _fs_cache_set/_fs_cache_get pair
+    double-encodes on write but only single-decodes on read, which leaves a
+    stray layer of escaping in whatever comes back.)"""
+    path = f"/set/{key}?EX={ttl_seconds}" if ttl_seconds else f"/set/{key}"
+    _upstash_request(path, method="POST", body=value)
+
+
+def _redis_get(key):
+    """Reads back anything written with _redis_set — one json.loads() undoes
+    the one json.dumps() layer _upstash_request applied on the way in, for
+    both plain strings and dicts."""
+    raw = _upstash_request(f"/get/{key}")
+    if raw is None:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
+def _redis_del(key):
+    _upstash_request(f"/del/{key}", method="POST")
+
+
+def _account_rate_limit_ok(key_prefix, max_per_hour):
+    bucket = f"{key_prefix}:{int(datetime.utcnow().timestamp() // 3600)}"
+    count = _upstash_request(f"/incr/{bucket}", method="POST")
+    if count is None:
+        return True  # fail open — a Redis hiccup shouldn't block sign-in
+    if count == 1:
+        _upstash_request(f"/expire/{bucket}/3600", method="POST")
+    return count <= max_per_hour
+
+
+def _send_login_email(to_address, login_link):
+    auth = base64.b64encode(f"api:{MAILGUN_API_KEY}".encode()).decode()
+    body = urllib.parse.urlencode({
+        "from": f"PNR Genius <noreply@{MAILGUN_SENDING_DOMAIN}>",
+        "to": to_address,
+        "subject": "Your PNR Genius sign-in link",
+        "text": (
+            "Hi,\n\nClick the link below to sign in to PNR Genius:\n\n"
+            f"{login_link}\n\n"
+            "This link works once and expires in 15 minutes. If you didn't "
+            "request this, you can safely ignore this email — no account "
+            "changes happen until the link is clicked.\n\n— PNR Genius"
+        ),
+    }).encode()
+    req = urllib.request.Request(
+        f"https://api.mailgun.net/v3/{MAILGUN_SENDING_DOMAIN}/messages",
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Basic {auth}",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=8) as resp:
+        return resp.status
+
+
+def _get_logged_in_email():
+    """Reads the Authorization: Bearer <session_token> header and returns the
+    signed-in email, or None if it's missing, malformed, or expired."""
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return None
+    session_token = auth_header[len("Bearer "):].strip()
+    if not session_token:
+        return None
+    return _redis_get(f"pnr-session:{session_token}")
+
+
+@app.route("/api/auth/request-login", methods=["POST"])
+def auth_request_login():
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+
+    if not email or len(email) > 200 or not EMAIL_RE.match(email):
+        return jsonify({"error": "Please enter a valid email address."}), 400
+
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0].strip()
+    if not _account_rate_limit_ok(f"login_ratelimit_ip:{ip}", max_per_hour=10):
+        return jsonify({"error": "Too many attempts. Please try again later."}), 429
+    if not _account_rate_limit_ok(f"login_ratelimit_email:{email}", max_per_hour=5):
+        return jsonify({"error": "Too many attempts. Please try again later."}), 429
+
+    token = secrets.token_urlsafe(32)
+    try:
+        _redis_set(f"pnr-login-token:{token}", email, LOGIN_TOKEN_TTL_SECONDS)
+        login_link = f"{SITE_URL}/?login_token={token}"
+        _send_login_email(email, login_link)
+    except Exception as e:
+        return jsonify({"error": "internal error", "detail": str(e)}), 500
+
+    return jsonify({"status": "sent"}), 200
+
+
+@app.route("/api/auth/verify", methods=["GET"])
+def auth_verify():
+    token = request.args.get("token", "")
+    if not token or len(token) > 100:
+        return jsonify({"error": "Missing or invalid token."}), 400
+
+    email = _redis_get(f"pnr-login-token:{token}")
+    if not email:
+        return jsonify({"error": "This link has expired or was already used."}), 404
+
+    # One-time use — delete immediately so the same link can't be replayed.
+    _redis_del(f"pnr-login-token:{token}")
+
+    # First login for this email doubles as account creation.
+    if not _redis_get(f"pnr-user:{email}"):
+        _redis_set(f"pnr-user:{email}", {"email": email, "created_at": datetime.utcnow().isoformat()})
+
+    session_token = secrets.token_urlsafe(32)
+    _redis_set(f"pnr-session:{session_token}", email, SESSION_TTL_SECONDS)
+
+    return jsonify({"session_token": session_token, "email": email}), 200
+
+
+@app.route("/api/auth/me", methods=["GET"])
+def auth_me():
+    email = _get_logged_in_email()
+    if not email:
+        return jsonify({"error": "Not logged in."}), 401
+    return jsonify({"email": email}), 200
+
+
+@app.route("/api/auth/logout", methods=["POST"])
+def auth_logout():
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        session_token = auth_header[len("Bearer "):].strip()
+        if session_token:
+            _redis_del(f"pnr-session:{session_token}")
+    return jsonify({"status": "ok"}), 200
 
 
 if __name__ == "__main__":
