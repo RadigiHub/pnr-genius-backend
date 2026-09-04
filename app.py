@@ -2035,6 +2035,186 @@ def bookings_delete(booking_id):
 
 
 # ---------------------------------------------------------------------------
+# SMART PNR DIFF (Phase 2, step 4)
+# ---------------------------------------------------------------------------
+# When a signed-in agent re-pastes and converts a PNR that matches one of
+# their saved bookings (matched by record locator / PNR reference), this
+# compares the newly-parsed data against what was saved and returns a plain-
+# English list of what changed — so the agent doesn't have to re-read the
+# whole itinerary to spot a schedule change, cancelled leg, etc.
+#
+# Two routes:
+#   POST /api/bookings/check-diff        -> silent background check, called
+#                                            automatically after every convert
+#                                            on the frontend. Never a hard
+#                                            error — always 200, "matched:
+#                                            false" for any case where there's
+#                                            nothing to show (not signed in,
+#                                            no match, no saved parsed data,
+#                                            no differences).
+#   POST /api/bookings/<id>/update        -> re-parses raw_text and overwrites
+#                                            that booking's stored raw_text +
+#                                            parsed, once the agent reviews
+#                                            the diff and chooses to update.
+# ---------------------------------------------------------------------------
+
+def _diff_segment_label(seg):
+    origin = (seg.get("origin") or {}).get("code", "?")
+    dest = (seg.get("destination") or {}).get("code", "?")
+    return f"{seg.get('airline_code', '')}{seg.get('flight_number', '')} ({origin} → {dest})"
+
+
+def _diff_bookings(old_parsed, new_parsed):
+    changes = []
+    old_segments = (old_parsed or {}).get("segments") or []
+    new_segments = (new_parsed or {}).get("segments") or []
+
+    common = min(len(old_segments), len(new_segments))
+    for i in range(common):
+        old_seg = old_segments[i] or {}
+        new_seg = new_segments[i] or {}
+        label = _diff_segment_label(new_seg)
+
+        if old_seg.get("airline_code") != new_seg.get("airline_code") or old_seg.get("flight_number") != new_seg.get("flight_number"):
+            changes.append(
+                f"Flight number changed: {old_seg.get('airline_code', '')}{old_seg.get('flight_number', '')} "
+                f"→ {new_seg.get('airline_code', '')}{new_seg.get('flight_number', '')}"
+            )
+            continue  # a different flight number makes finer-grained diffs on this leg meaningless
+
+        old_origin = (old_seg.get("origin") or {}).get("code")
+        new_origin = (new_seg.get("origin") or {}).get("code")
+        old_dest = (old_seg.get("destination") or {}).get("code")
+        new_dest = (new_seg.get("destination") or {}).get("code")
+        if old_origin != new_origin or old_dest != new_dest:
+            changes.append(f"{label}: Route changed from {old_origin}-{old_dest} to {new_origin}-{new_dest}")
+
+        if old_seg.get("date_iso") != new_seg.get("date_iso"):
+            changes.append(f"{label}: Date changed from {old_seg.get('date') or old_seg.get('date_iso') or '?'} to {new_seg.get('date') or new_seg.get('date_iso') or '?'}")
+
+        if old_seg.get("departure_time") != new_seg.get("departure_time"):
+            changes.append(f"{label}: Departure time changed from {old_seg.get('departure_time') or '?'} to {new_seg.get('departure_time') or '?'}")
+
+        if old_seg.get("arrival_time") != new_seg.get("arrival_time"):
+            changes.append(f"{label}: Arrival time changed from {old_seg.get('arrival_time') or '?'} to {new_seg.get('arrival_time') or '?'}")
+
+        if old_seg.get("status") != new_seg.get("status"):
+            changes.append(f"{label}: Status changed from {old_seg.get('status') or '?'} to {new_seg.get('status') or '?'}")
+
+        if old_seg.get("booking_class") != new_seg.get("booking_class"):
+            changes.append(f"{label}: Booking class changed from {old_seg.get('booking_class') or '?'} to {new_seg.get('booking_class') or '?'}")
+
+    if len(new_segments) > len(old_segments):
+        for seg in new_segments[len(old_segments):]:
+            changes.append(f"New flight added: {_diff_segment_label(seg)} on {seg.get('date') or seg.get('date_iso') or '?'}")
+    elif len(old_segments) > len(new_segments):
+        for seg in old_segments[len(new_segments):]:
+            changes.append(f"Flight removed: {_diff_segment_label(seg)} (was on {seg.get('date') or seg.get('date_iso') or '?'})")
+
+    old_names = sorted(p.get("full_name", "") for p in (old_parsed or {}).get("passengers") or [])
+    new_names = sorted(p.get("full_name", "") for p in (new_parsed or {}).get("passengers") or [])
+    if old_names != new_names:
+        added = [n for n in new_names if n not in old_names]
+        removed = [n for n in old_names if n not in new_names]
+        if added:
+            changes.append(f"Passenger(s) added: {', '.join(added)}")
+        if removed:
+            changes.append(f"Passenger(s) removed: {', '.join(removed)}")
+
+    return changes
+
+
+def _find_matching_booking(bookings, new_parsed):
+    pnr_ref = (new_parsed or {}).get("pnr_reference")
+    if not pnr_ref:
+        return None
+    pnr_ref = pnr_ref.upper()
+    matches = [
+        b for b in bookings
+        if ((b.get("parsed") or {}).get("pnr_reference") or "").upper() == pnr_ref
+    ]
+    # If more than one saved booking shares this record locator, it's
+    # ambiguous which one the agent means — stay silent rather than guess.
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+@app.route("/api/bookings/check-diff", methods=["POST"])
+def bookings_check_diff():
+    email = _get_logged_in_email()
+    if not email:
+        return jsonify({"matched": False}), 200
+
+    data = request.get_json(silent=True) or {}
+    raw_text = (data.get("raw_text") or "").strip()
+    if not raw_text:
+        return jsonify({"matched": False}), 200
+
+    try:
+        new_parsed = parse_pnr(raw_text)
+    except Exception:
+        return jsonify({"matched": False}), 200
+
+    bookings = _get_bookings(email)
+    matched_booking = _find_matching_booking(bookings, new_parsed)
+    if not matched_booking:
+        return jsonify({"matched": False}), 200
+
+    old_parsed = matched_booking.get("parsed") or {}
+    if not old_parsed.get("segments"):
+        return jsonify({"matched": False}), 200
+
+    changes = _diff_bookings(old_parsed, new_parsed)
+
+    return jsonify({
+        "matched": True,
+        "booking_id": matched_booking.get("id"),
+        "booking_label": matched_booking.get("label"),
+        "has_changes": len(changes) > 0,
+        "changes": changes,
+    }), 200
+
+
+@app.route("/api/bookings/<booking_id>/update", methods=["POST"])
+def bookings_apply_update(booking_id):
+    email = _get_logged_in_email()
+    if not email:
+        return jsonify({"error": "Please sign in first."}), 401
+
+    if not _account_rate_limit_ok(f"bookings_ratelimit:{email}", max_per_hour=60):
+        return jsonify({"error": "Too many updates. Please try again later."}), 429
+
+    data = request.get_json(silent=True) or {}
+    raw_text = (data.get("raw_text") or "").strip()[:BOOKING_RAW_TEXT_MAX_LENGTH]
+    if not raw_text:
+        return jsonify({"error": "No PNR text provided."}), 400
+
+    try:
+        parsed = parse_pnr(raw_text)
+    except ValueError as ve:
+        return jsonify({"error": str(ve)}), 400
+
+    bookings = _get_bookings(email)
+    target_index = next((i for i, b in enumerate(bookings) if b.get("id") == booking_id), None)
+    if target_index is None:
+        return jsonify({"error": "Booking not found."}), 404
+
+    updated = dict(bookings[target_index])
+    updated["raw_text"] = raw_text
+    updated["parsed"] = parsed
+    updated["updated_at"] = datetime.utcnow().isoformat()
+
+    if len(json.dumps(updated)) > BOOKING_RECORD_MAX_BYTES:
+        return jsonify({"error": "This PNR is too large to save."}), 400
+
+    bookings[target_index] = updated
+    _redis_set(_bookings_key(email), bookings)
+
+    return jsonify(updated), 200
+
+
+# ---------------------------------------------------------------------------
 # SCHEDULE-CHANGE ALERTS (Phase 2, step 3)
 # ---------------------------------------------------------------------------
 # This runs on a schedule driven by an OUTSIDE trigger (a GitHub Actions
